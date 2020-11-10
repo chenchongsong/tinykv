@@ -16,8 +16,10 @@ package raft
 
 import (
 	"errors"
-
+	"fmt"
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"strings"
 )
 
 // None is a placeholder node ID used when there is no leader.
@@ -140,6 +142,9 @@ type Raft struct {
 	heartbeatElapsed int
 	// number of ticks since it reached last electionTimeout
 	electionElapsed int
+	// randomizedElectionTimeout is a random number between
+	// [electiontimeout, 2 * electiontimeout - 1].
+	randomizedElectionTimeout int
 
 	// leadTransferee is id of the leader transfer target when its value is not zero.
 	// Follow the procedure defined in section 3.10 of Raft phd thesis.
@@ -163,63 +168,119 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	return nil
+	raftlog := newLog(c.Storage)
+	peers := c.peers
+	r := &Raft{
+		id:               c.ID,
+		Lead:             None,
+		RaftLog:          raftlog,
+		Prs:              make(map[uint64]*Progress),
+		electionTimeout:  c.ElectionTick,
+		heartbeatTimeout: c.HeartbeatTick,
+	}
+	for _, p := range peers {
+		r.Prs[p] = &Progress{Next: 1}
+	}
+	if c.Applied > 0 {
+		raftlog.appliedTo(c.Applied)
+	}
+	r.becomeFollower(r.Term, None)
+
+	var nodesStrs []string
+	for _, n := range nodes(r) {
+		nodesStrs = append(nodesStrs, fmt.Sprintf("%d", n))
+	}
+
+	log.Infof("newRaft %d [peers: [%s], term: %d, commit: %d, applied: %d, lastindex: %d, lastterm: %d]",
+		r.id, strings.Join(nodesStrs, ","), r.Term, r.RaftLog.committed, r.RaftLog.applied, r.RaftLog.LastIndex(), r.RaftLog.lastTerm())
+	return r
 }
 
-// sendAppend sends an append RPC with new entries (if any) and the
-// current commit index to the given peer. Returns true if a message was sent.
-func (r *Raft) sendAppend(to uint64) bool {
-	// Your Code Here (2A).
-	return false
+// 2A
+func (r *Raft) quorum() int { return len(r.Prs)/2 + 1 }
+
+// send persists state to stable storage and then sends to its mailbox.
+func (r *Raft) send(m pb.Message) {
+	m.From = r.id
+	if m.MsgType == pb.MessageType_MsgRequestVote || m.MsgType == pb.MessageType_MsgRequestVoteResponse {
+		if m.Term == 0 {
+			// All campaign messages need to have the term set when sending.
+			// - MessageType_MsgRequestVote: m.Term is the term the node is campaigning for,
+			//   non-zero as we increment the term when campaigning.
+			// - MessageType_MsgRequestVoteResponse: m.Term is the new r.Term if the MessageType_MsgRequestVote was
+			//   granted, non-zero for the same reason MessageType_MsgRequestVote is
+			panic(fmt.Sprintf("term should be set when sending %s", m.MsgType))
+		}
+	} else {
+		if m.Term != 0 {
+			panic(fmt.Sprintf("term should not be set when sending %s (was %d)", m.MsgType, m.Term))
+		}
+		// do not attach term to MessageType_MsgPropose
+		// proposals are a way to forward to the leader and
+		// should be treated as local message.
+		if m.MsgType != pb.MessageType_MsgPropose {
+			m.Term = r.Term
+		}
+	}
+	r.msgs = append(r.msgs, m)
 }
 
-// sendHeartbeat sends a heartbeat RPC to the given peer.
-func (r *Raft) sendHeartbeat(to uint64) {
-	// Your Code Here (2A).
+// 2A
+func (r *Raft) getProgress(id uint64) *Progress {
+	return r.Prs[id]
 }
+
+// 2A
+func (r *Raft) forEachProgress(f func(id uint64, pr *Progress)) {
+	for id, pr := range r.Prs {
+		f(id, pr)
+	}
+}
+
 
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
-}
-
-// becomeFollower transform this peer's state to Follower
-func (r *Raft) becomeFollower(term uint64, lead uint64) {
-	// Your Code Here (2A).
-}
-
-// becomeCandidate transform this peer's state to candidate
-func (r *Raft) becomeCandidate() {
-	// Your Code Here (2A).
-}
-
-// becomeLeader transform this peer's state to leader
-func (r *Raft) becomeLeader() {
-	// Your Code Here (2A).
-	// NOTE: Leader should propose a noop entry on its term
-}
-
-// Step the entrance of handle message, see `MessageType`
-// on `eraftpb.proto` for what msgs should be handled
-func (r *Raft) Step(m pb.Message) error {
-	// Your Code Here (2A).
 	switch r.State {
-	case StateFollower:
-	case StateCandidate:
+	case StateFollower, StateCandidate:
+		r.tickElection()
 	case StateLeader:
+		r.tickHeartbeat()
 	}
-	return nil
+}
+// 2A
+// tickElection is run by followers and candidates after r.electionTimeout.
+func (r *Raft) tickElection() {
+	r.electionElapsed++
+	if r.promotable() && r.pastElectionTimeout() {
+		r.electionElapsed = 0
+		r.Step(pb.Message{From: r.id, MsgType: pb.MessageType_MsgHup})
+	}
+}
+// 2A
+// tickHeartbeat is run by leaders to send a MessageType_MsgBeat after r.heartbeatTimeout.
+func (r *Raft) tickHeartbeat() {
+	r.heartbeatElapsed++
+	r.electionElapsed++
+
+	if r.electionElapsed >= r.electionTimeout {
+		r.electionElapsed = 0
+		// If current leader cannot transfer leadership in electionTimeout, it becomes leader again.
+		if r.State == StateLeader && r.leadTransferee != None {
+			r.abortLeaderTransfer()
+		}
+	}
+
+	if r.State != StateLeader {
+		return
+	}
+
+	if r.heartbeatElapsed >= r.heartbeatTimeout {
+		r.heartbeatElapsed = 0
+		r.Step(pb.Message{From: r.id, MsgType: pb.MessageType_MsgBeat})
+	}
 }
 
-// handleAppendEntries handle AppendEntries RPC request
-func (r *Raft) handleAppendEntries(m pb.Message) {
-	// Your Code Here (2A).
-}
-
-// handleHeartbeat handle Heartbeat RPC request
-func (r *Raft) handleHeartbeat(m pb.Message) {
-	// Your Code Here (2A).
-}
 
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
