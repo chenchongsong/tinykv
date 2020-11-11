@@ -10,7 +10,45 @@ import (
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-	return false
+	pr := r.getProgress(to)
+	m := pb.Message{}
+	m.To = to
+
+	term, errt := r.RaftLog.Term(pr.Next - 1)
+	ents, erre := r.RaftLog.Entries(pr.Next)
+
+	if errt != nil || erre != nil { // send snapshot if we failed to get term or entries
+		m.MsgType = pb.MessageType_MsgSnapshot
+		snapshot, err := r.RaftLog.snapshot()
+		if err != nil {
+			if err == ErrSnapshotTemporarilyUnavailable {
+				log.Debugf("%d failed to send snapshot to %d because snapshot is temporarily unavailable", r.id, to)
+				return false
+			}
+			panic(err)
+		}
+		if IsEmptySnap(&snapshot) {
+			panic("need non-empty snapshot")
+		}
+		m.Snapshot = &snapshot
+		sindex, sterm := snapshot.Metadata.Index, snapshot.Metadata.Term
+		log.Debugf("%d [firstindex: %d, commit: %d] sent snapshot[index: %d, term: %d] to %d [%v]",
+			r.id, r.RaftLog.firstIndex(), r.RaftLog.committed, sindex, sterm, to, pr)
+		log.Debugf("%d paused sending replication messages to %d [%v]", r.id, to, pr)
+	} else {
+		m.MsgType = pb.MessageType_MsgAppend
+		m.Index = pr.Next - 1
+		m.LogTerm = term
+
+		entries := make([]*pb.Entry, 0, len(ents))
+		for i := range ents {
+			entries = append(entries, &ents[i])
+		}
+		m.Entries = entries
+		m.Commit = r.RaftLog.committed
+	}
+	r.send(m)
+	return true
 }
 // 2A
 // bcastAppend sends RPC, with entries to all peers that are not up-to-date

@@ -48,8 +48,11 @@ type RaftLog struct {
 	// all entries that have not yet compact.
 	entries []pb.Entry
 
-	// the incoming unstable snapshot, if any.
 	// (Used in 2C)
+	// snapIndex and snapTerm are the most recent snapshot's index and term
+	snapTerm  uint64
+	snapIndex uint64
+	// the incoming unstable snapshot, if any.
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
@@ -75,6 +78,10 @@ func newLog(storage Storage) *RaftLog {
 	if err != nil {
 		panic(err)
 	}
+	snapTerm, err := storage.Term(firstIndex - 1)
+	if err != nil {
+		panic(err)
+	}
 	// get all entris from storage
 	entries, err := storage.Entries(firstIndex, lastIndex+1)
 	if err != nil {
@@ -82,6 +89,8 @@ func newLog(storage Storage) *RaftLog {
 	}
 	log.entries = entries
 	log.offset = firstIndex
+	log.snapIndex = firstIndex - 1
+	log.snapTerm = snapTerm
 	log.stabled = lastIndex
 	// Initialize our committed and applied pointers to the time of the last compaction.
 	log.committed = firstIndex - 1
@@ -175,22 +184,61 @@ func (l *RaftLog) findConflict(ents []pb.Entry) uint64 {
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2B).
-	return nil
+	if int(l.stabled+1-l.offset) > len(l.entries) {
+		return nil
+	}
+	return l.entries[l.stabled+1-l.offset:]
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2B).
+	return l.nextEntsSince(l.applied)
+}
+
+// 2A
+func (l *RaftLog) nextEntsSince(sinceIdx uint64) (ents []pb.Entry) {
+	off := max(sinceIdx+1, l.firstIndex())
+	if l.committed+1 > off {
+		ents, err := l.slice(off, l.committed+1)
+		if err != nil {
+			log.Panicf("unexpected error when getting unapplied entries (%v)", err)
+		}
+		return ents
+	}
 	return nil
 }
 
-// LastIndex return the last index of the log entries
+
+// 2A
+func (l *RaftLog) snapshot() (pb.Snapshot, error) {
+	if l.pendingSnapshot != nil {
+		return *l.pendingSnapshot, nil
+	}
+	return l.storage.Snapshot()
+}
+
+// 2A
+func (l *RaftLog) firstIndex() uint64 {
+	if len(l.entries) != 0 {
+		return l.entries[0].Index
+	}
+	if l.pendingSnapshot != nil {
+		return l.pendingSnapshot.Metadata.Index
+	}
+	return l.snapIndex
+}
+
+// LastIndex return the last index of the lon entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
 	if len(l.entries) != 0 {
 		return l.entries[len(l.entries)-1].Index
 	}
-	return 0
+	if l.pendingSnapshot != nil {
+		return l.pendingSnapshot.Metadata.Index
+	}
+	return l.snapIndex
 }
 
 // 2A
@@ -214,7 +262,7 @@ func (l *RaftLog) appliedTo(i uint64) {
 	l.applied = i
 }
 
-// TODO: Delete method
+// 2A
 func (l *RaftLog) lastTerm() uint64 {
 	t, err := l.Term(l.LastIndex())
 	if err != nil {
@@ -226,6 +274,9 @@ func (l *RaftLog) lastTerm() uint64 {
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
+	if i == l.snapIndex {
+		return l.snapTerm, nil
+	}
 	if len(l.entries) == 0 {
 		return 0, ErrCompacted
 	}
@@ -236,6 +287,28 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 		return 0, ErrUnavailable
 	}
 	return l.entries[i-l.offset].Term, nil
+}
+
+// 2A
+func (l *RaftLog) Entries(i uint64) ([]pb.Entry, error) {
+	if i < l.firstIndex() {
+		return nil, ErrCompacted
+	}
+	if i > l.LastIndex() {
+		return nil, nil
+	}
+	return l.entries[i-l.offset:], nil
+}
+
+// 2A
+// isUpToDate determines if the given (lastIndex,term) log is more up-to-date
+// by comparing the index and term of the last entries in the existing logs.
+// If the logs have last entries with different terms, then the log with the
+// later term is more up-to-date. If the logs end with the same term, then
+// whichever log has the larger lastIndex is more up-to-date. If the logs are
+// the same, the given log is up-to-date.
+func (l *RaftLog) isUpToDate(lasti, term uint64) bool {
+	return term > l.lastTerm() || (term == l.lastTerm() && lasti >= l.LastIndex())
 }
 
 // 2A
@@ -256,6 +329,32 @@ func (l *RaftLog) maybeCommit(maxIndex, term uint64) bool {
 }
 
 // 2A
+// slice returns a slice of log entries from lo through hi-1, inclusive.
+func (l *RaftLog) slice(lo, hi uint64) ([]pb.Entry, error) {
+	if err := l.mustCheckOutOfBounds(lo, hi); err != nil || len(l.entries) == 0 {
+		return nil, err
+	}
+	return l.entries[lo-l.offset : hi-l.offset], nil
+}
+// 2A
+// l.firstIndex <= lo <= hi <= l.firstIndex + len(l.entries)
+func (l *RaftLog) mustCheckOutOfBounds(lo, hi uint64) error {
+	if lo > hi {
+		log.Panicf("invalid slice %d > %d", lo, hi)
+	}
+	fi := l.firstIndex()
+	if lo < fi {
+		return ErrCompacted
+	}
+
+	if hi > l.LastIndex()+1 {
+		log.Panicf("slice[%d,%d) out of bound [%d,%d]", lo, hi, fi, l.LastIndex())
+	}
+	return nil
+}
+
+// 2A
+// For debugging messages
 func (l *RaftLog) zeroTermOnRangeErr(t uint64, err error) uint64 {
 	if err == nil {
 		return t

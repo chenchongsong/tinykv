@@ -8,22 +8,77 @@ import (
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
-	// Your Code Here (2A).
-	switch r.State {
-	case StateFollower:
-		err := r.stepFollower(m)
-		if err != nil {
-			return err
+	// Your Code Here 2A
+	// Handle the message term, which may result in our stepping down to a follower.
+	switch {
+	case m.Term == 0:
+		// local message
+	case m.Term > r.Term:
+		log.Infof("%d [term: %d] received a %s message with higher term from %d [term: %d]",
+			r.id, r.Term, m.MsgType, m.From, m.Term)
+		if m.MsgType == pb.MessageType_MsgAppend || m.MsgType == pb.MessageType_MsgHeartbeat || m.MsgType == pb.MessageType_MsgSnapshot {
+			r.becomeFollower(m.Term, m.From)
+		} else {
+			r.becomeFollower(m.Term, None)
 		}
-	case StateCandidate:
-		err := r.stepCandidate(m)
-		if err != nil {
-			return err
+	case m.Term < r.Term:
+		log.Infof("%d [term: %d] ignored a %s message with lower term from %d [term: %d]", r.id, r.Term, m.MsgType, m.From, m.Term)
+		return nil
+	}
+
+	switch m.MsgType {
+	case pb.MessageType_MsgHup:
+		if r.State != StateLeader {
+			ents, err := r.RaftLog.slice(r.RaftLog.applied+1, r.RaftLog.committed+1)
+			if err != nil {
+				log.Panicf("unexpected error getting unapplied entries (%v)", err)
+			}
+			if n := numOfPendingConf(ents); n != 0 && r.RaftLog.committed > r.RaftLog.applied {
+				log.Warningf("%d cannot campaign at term %d since there are still %d pending configuration changes to apply", r.id, r.Term, n)
+				return nil
+			}
+
+			log.Infof("%d is starting a new election at term %d", r.id, r.Term)
+
+			r.campaign()
+		} else {
+			log.Debugf("%d ignoring MessageType_MsgHup because already leader", r.id)
 		}
-	case StateLeader:
-		err := r.stepLeader(m)
-		if err != nil {
-			return err
+	case pb.MessageType_MsgRequestVote:
+		// We can vote if this is a repeat of a vote we've already cast...
+		canVote := r.Vote == m.From ||
+			// ...we haven't voted and we don't think there's a leader yet in this term...
+			(r.Vote == None && r.Lead == None)
+		// ...and we believe the candidate is up to date.
+		if canVote && r.RaftLog.isUpToDate(m.Index, m.LogTerm) {
+			log.Infof("%d [logterm: %d, index: %d, vote: %d] cast %s for %d [logterm: %d, index: %d] at term %d",
+				r.id, r.RaftLog.lastTerm(), r.RaftLog.LastIndex(), r.Vote, m.MsgType, m.From, m.LogTerm, m.Index, r.Term)
+			r.send(pb.Message{To: m.From, Term: m.Term, MsgType: pb.MessageType_MsgRequestVoteResponse})
+			// Only record real votes.
+			r.electionElapsed = 0
+			r.Vote = m.From
+		} else {
+			log.Infof("%d [logterm: %d, index: %d, vote: %d] rejected %s from %d [logterm: %d, index: %d] at term %d",
+				r.id, r.RaftLog.lastTerm(), r.RaftLog.LastIndex(), r.Vote, m.MsgType, m.From, m.LogTerm, m.Index, r.Term)
+			r.send(pb.Message{To: m.From, Term: r.Term, MsgType: pb.MessageType_MsgRequestVoteResponse, Reject: true})
+		}
+	default:
+		switch r.State {
+		case StateFollower:
+			err := r.stepFollower(m)
+			if err != nil {
+				return err
+			}
+		case StateCandidate:
+			err := r.stepCandidate(m)
+			if err != nil {
+				return err
+			}
+		case StateLeader:
+			err := r.stepLeader(m)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -33,15 +88,13 @@ func (r *Raft) Step(m pb.Message) error {
 // stepLeader handle leader's message
 func (r *Raft) stepLeader(m pb.Message) error {
 	// Your Code Here 2A
-	// TODO: Delete Start
 	pr := r.getProgress(m.From)
 	if pr == nil && m.MsgType != pb.MessageType_MsgBeat && m.MsgType != pb.MessageType_MsgPropose {
 		log.Debugf("%d no progress available for %d", r.id, m.From)
 		return nil
 	}
-	// TODO: Delete End
+
 	switch m.MsgType {
-	// TODO: Delete Start
 	case pb.MessageType_MsgBeat:
 		r.bcastHeartbeat()
 		return nil
@@ -131,7 +184,6 @@ func (r *Raft) stepLeader(m pb.Message) error {
 		} else {
 			r.sendAppend(leadTransferee)
 		}
-		// TODO: Delete End
 	}
 	return nil
 }
@@ -141,7 +193,6 @@ func (r *Raft) stepLeader(m pb.Message) error {
 func (r *Raft) stepCandidate(m pb.Message) error {
 	// Your Code Here 2A
 	switch m.MsgType {
-	// TODO: Delete Start
 	case pb.MessageType_MsgPropose:
 		log.Infof("%d no leader at term %d; dropping proposal", r.id, r.Term)
 		return ErrProposalDropped
@@ -167,7 +218,6 @@ func (r *Raft) stepCandidate(m pb.Message) error {
 		}
 	case pb.MessageType_MsgTimeoutNow:
 		log.Debugf("%d [term %d state %v] ignored MessageType_MsgTimeoutNow from %d", r.id, r.Term, r.State, m.From)
-		// TODO: Delete End
 	}
 	return nil
 }
@@ -230,4 +280,15 @@ func (pr *Progress) maybeDecrTo(rejected, last uint64) bool {
 		pr.Next = 1
 	}
 	return true
+}
+
+
+func numOfPendingConf(ents []pb.Entry) int {
+	n := 0
+	for i := range ents {
+		if ents[i].EntryType == pb.EntryType_EntryConfChange {
+			n++
+		}
+	}
+	return n
 }

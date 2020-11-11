@@ -103,11 +103,6 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// Progress represents a follower’s progress in the view of the leader. Leader maintains
-// progresses of all followers, and sends entries to the follower based on its progress.
-type Progress struct {
-	Match, Next uint64
-}
 
 type Raft struct {
 	id uint64
@@ -137,11 +132,6 @@ type Raft struct {
 	heartbeatTimeout int
 	// baseline of election interval
 	electionTimeout int
-	// number of ticks since it reached last heartbeatTimeout.
-	// only leader keeps heartbeatElapsed.
-	heartbeatElapsed int
-	// number of ticks since it reached last electionTimeout
-	electionElapsed int
 	// randomizedElectionTimeout is a random number between
 	// [electiontimeout, 2 * electiontimeout - 1].
 	randomizedElectionTimeout int
@@ -158,8 +148,15 @@ type Raft struct {
 	// configuration change (if any). Config changes are only allowed to
 	// be proposed if the leader's applied index is greater than this
 	// value.
-	// (Used in 3A conf change)
 	PendingConfIndex uint64
+
+	// 2A
+	// number of ticks since it reached last electionTimeout
+	electionElapsed int
+
+	// number of ticks since it reached last heartbeatTimeout.
+	// only leader keeps heartbeatElapsed.
+	heartbeatElapsed int
 }
 
 // newRaft return a raft peer with the given config
@@ -169,7 +166,17 @@ func newRaft(c *Config) *Raft {
 	}
 	// Your Code Here (2A).
 	raftlog := newLog(c.Storage)
+	hs, cs, err := c.Storage.InitialState()
+	if err != nil {
+		panic(err)
+	}
 	peers := c.peers
+	if len(cs.Nodes) > 0 {
+		if len(peers) > 0 {
+			panic("cannot specify both newRaft (peers) and ConfState.(Nodes)")
+		}
+		peers = cs.Nodes
+	}
 	r := &Raft{
 		id:               c.ID,
 		Lead:             None,
@@ -181,6 +188,10 @@ func newRaft(c *Config) *Raft {
 	for _, p := range peers {
 		r.Prs[p] = &Progress{Next: 1}
 	}
+
+	if !IsEmptyHardState(hs) {
+		r.loadState(hs)
+	}
 	if c.Applied > 0 {
 		raftlog.appliedTo(c.Applied)
 	}
@@ -190,7 +201,6 @@ func newRaft(c *Config) *Raft {
 	for _, n := range nodes(r) {
 		nodesStrs = append(nodesStrs, fmt.Sprintf("%d", n))
 	}
-
 	log.Infof("newRaft %d [peers: [%s], term: %d, commit: %d, applied: %d, lastindex: %d, lastterm: %d]",
 		r.id, strings.Join(nodesStrs, ","), r.Term, r.RaftLog.committed, r.RaftLog.applied, r.RaftLog.LastIndex(), r.RaftLog.lastTerm())
 	return r
@@ -199,6 +209,7 @@ func newRaft(c *Config) *Raft {
 // 2A
 func (r *Raft) quorum() int { return len(r.Prs)/2 + 1 }
 
+// 2A
 // send persists state to stable storage and then sends to its mailbox.
 func (r *Raft) send(m pb.Message) {
 	m.From = r.id
@@ -225,22 +236,32 @@ func (r *Raft) send(m pb.Message) {
 	r.msgs = append(r.msgs, m)
 }
 
+
+// Progress represents a follower’s progress in the view of the leader. Leader maintains
+// progresses of all followers, and sends entries to the follower based on its progress.
+type Progress struct {
+	Match, Next uint64
+}
 // 2A
 func (r *Raft) getProgress(id uint64) *Progress {
 	return r.Prs[id]
 }
-
 // 2A
 func (r *Raft) forEachProgress(f func(id uint64, pr *Progress)) {
 	for id, pr := range r.Prs {
 		f(id, pr)
 	}
 }
+// 2A
+func (r *Raft) setProgress(id, match, next uint64) {
+	r.Prs[id] = &Progress{Next: next, Match: match}
+	return
+}
 
 
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
-	// Your Code Here (2A).
+	// Your Code Here 2A
 	switch r.State {
 	case StateFollower, StateCandidate:
 		r.tickElection()
@@ -270,15 +291,24 @@ func (r *Raft) tickHeartbeat() {
 			r.abortLeaderTransfer()
 		}
 	}
-
 	if r.State != StateLeader {
 		return
 	}
-
 	if r.heartbeatElapsed >= r.heartbeatTimeout {
 		r.heartbeatElapsed = 0
 		r.Step(pb.Message{From: r.id, MsgType: pb.MessageType_MsgBeat})
 	}
+}
+
+
+// 2A
+func (r *Raft) loadState(state pb.HardState) {
+	if state.Commit < r.RaftLog.committed || state.Commit > r.RaftLog.LastIndex() {
+		log.Panicf("%d state.commit %d is out of range [%d, %d]", r.id, state.Commit, r.RaftLog.committed, r.RaftLog.LastIndex())
+	}
+	r.RaftLog.committed = state.Commit
+	r.Term = state.Term
+	r.Vote = state.Vote
 }
 
 
@@ -287,11 +317,11 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
 }
 
+
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
 }
-
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
