@@ -209,6 +209,19 @@ func (l *RaftLog) nextEntsSince(sinceIdx uint64) (ents []pb.Entry) {
 	return nil
 }
 
+// 2AC
+// hasNextEnts returns true if there is any committed but not
+// applied entries
+func (l *RaftLog) hasNextEnts() bool {
+	return l.hasNextEntsSince(l.applied)
+}
+
+// 2AC
+func (l *RaftLog) hasNextEntsSince(sinceIdx uint64) bool {
+	off := max(sinceIdx+1, l.firstIndex())
+	return l.committed+1 > off
+}
+
 
 // 2A
 func (l *RaftLog) snapshot() (pb.Snapshot, error) {
@@ -260,6 +273,20 @@ func (l *RaftLog) appliedTo(i uint64) {
 		log.Panicf("applied(%d) is out of range [prevApplied(%d), committed(%d)]", i, l.applied, l.committed)
 	}
 	l.applied = i
+}
+
+// 2AC
+func (l *RaftLog) stableTo(idx, term uint64) {
+	if l.matchTerm(idx, term) && l.stabled < idx {
+		l.stabled = idx
+	}
+}
+
+// 2AC
+func (l *RaftLog) stableSnapTo(i uint64) {
+	if l.pendingSnapshot != nil && l.pendingSnapshot.Metadata.Index == i {
+		l.pendingSnapshot = nil
+	}
 }
 
 // 2A

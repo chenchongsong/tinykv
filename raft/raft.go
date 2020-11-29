@@ -310,8 +310,25 @@ func (r *Raft) loadState(state pb.HardState) {
 	r.Term = state.Term
 	r.Vote = state.Vote
 }
+// 2AC
+// softState return the softState of this peer
+func (r *Raft) softState() *SoftState {
+	return &SoftState{Lead: r.Lead, RaftState: r.State}
+}
+// 2AC
+// hardState return the hardState of this peer
+func (r *Raft) hardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
+}
 
-
+// 2AC
+func (r *Raft) GetSnap() *pb.Snapshot {
+	return r.RaftLog.pendingSnapshot
+}
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
