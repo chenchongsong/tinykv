@@ -86,7 +86,7 @@ func TestPeerStorageTerm(t *testing.T) {
 func appendEnts(t *testing.T, peerStore *PeerStorage, ents []eraftpb.Entry) {
 	raftWB := new(engine_util.WriteBatch)
 	require.Nil(t, peerStore.Append(ents, raftWB))
-	raftWB.SetMeta(meta.RaftStateKey(peerStore.region.GetId()), peerStore.raftState)
+	raftWB.SetMeta(meta.RaftStateKey(peerStore.region.GetId()), &peerStore.raftState)
 	require.Nil(t, peerStore.Engines.WriteRaft(raftWB))
 }
 

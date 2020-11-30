@@ -28,13 +28,15 @@ const (
 
 type peerMsgHandler struct {
 	*peer
-	ctx *GlobalContext
+	applyCh chan []message.Msg
+	ctx     *GlobalContext
 }
 
-func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
+func newPeerMsgHandler(peer *peer, applyCh chan []message.Msg, ctx *GlobalContext) *peerMsgHandler {
 	return &peerMsgHandler{
-		peer: peer,
-		ctx:  ctx,
+		peer:    peer,
+		applyCh: applyCh,
+		ctx:     ctx,
 	}
 }
 
@@ -43,6 +45,29 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		return
 	}
 	// Your Code Here (2B).
+	msgs := make([]message.Msg, 0)
+	if p := d.TakeApplyProposals(); p != nil {
+		msg := message.Msg{Type: message.MsgTypeApplyProposal, Data: p, RegionID: p.RegionId}
+		msgs = append(msgs, msg)
+	}
+	applySnapResult, msgs := d.peer.HandleRaftReady(msgs, d.ctx.schedulerTaskSender, d.ctx.trans)
+	if applySnapResult != nil {
+		prevRegion := applySnapResult.PrevRegion
+		region := applySnapResult.Region
+
+		log.Infof("%s snapshot for region %s is applied", d.Tag, region)
+		meta := d.ctx.storeMeta
+		initialized := len(prevRegion.Peers) > 0
+		if initialized {
+			log.Infof("%s region changed from %s -> %s after applying snapshot", d.Tag, prevRegion, region)
+			meta.regionRanges.Delete(&regionItem{region: prevRegion})
+		}
+		if oldRegion := meta.regionRanges.ReplaceOrInsert(&regionItem{region: region}); oldRegion != nil {
+			panic(fmt.Sprintf("%s unexpected old region %+v, region %+v", d.Tag, oldRegion, region))
+		}
+		meta.regions[region.Id] = region
+	}
+	d.applyCh <- msgs
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -57,6 +82,9 @@ func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
 		d.proposeRaftCommand(raftCMD.Request, raftCMD.Callback)
 	case message.MsgTypeTick:
 		d.onTick()
+	case message.MsgTypeApplyRes:
+		res := msg.Data.(*MsgApplyRes)
+		d.onApplyResult(res)
 	case message.MsgTypeSplitRegion:
 		split := msg.Data.(*message.MsgSplitRegion)
 		log.Infof("%s on split with %v", d.Tag, split.SplitKey)
@@ -114,6 +142,19 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
+
+	if d.stopped {
+		NotifyReqRegionRemoved(d.regionId, cb)
+		return
+	}
+
+	// Note:
+	// The peer that is being checked is a leader. It might step down to be a follower later. It
+	// doesn't matter whether the peer is a leader or not. If it's not a leader, the proposing
+	// command log entry can't be committed.
+	resp := &raft_cmdpb.RaftCmdResponse{}
+	BindRespTerm(resp, d.Term())
+	d.Propose(d.ctx.engine.Kv, d.ctx.cfg, cb, msg, resp)
 }
 
 func (d *peerMsgHandler) onTick() {
@@ -146,11 +187,51 @@ func (d *peerMsgHandler) startTicker() {
 }
 
 func (d *peerMsgHandler) onRaftBaseTick() {
+	// When having pending snapshot, if election timeout is met, it can't pass
+	// the pending conf change check because first index has been updated to
+	// a value that is larger than last index.
+	if d.HasPendingSnapshot() {
+		// need to check if snapshot is applied.
+		d.ticker.schedule(PeerTickRaft)
+		return
+	}
+	// TODO: make Tick returns bool to indicate if there is ready.
 	d.RaftGroup.Tick()
 	d.ticker.schedule(PeerTickRaft)
 }
 
-func (d *peerMsgHandler) ScheduleCompactLog(firstIndex uint64, truncatedIndex uint64) {
+func (d *peerMsgHandler) onApplyResult(res *MsgApplyRes) {
+	// Your Code Here (2B).
+	log.Debugf("%s async apply finished %v", d.Tag, res)
+	// handle executing committed log results
+	for _, result := range res.execResults {
+		switch x := result.(type) {
+		case *execResultChangePeer:
+			d.onReadyChangePeer(x)
+		case *execResultCompactLog:
+			d.onReadyCompactLog(x.firstIndex, x.truncatedIndex)
+		case *execResultSplitRegion:
+			d.onReadySplitRegion(x.derived, x.regions)
+		}
+	}
+	res.execResults = nil
+	if d.stopped {
+		return
+	}
+
+	diff := d.SizeDiffHint + res.sizeDiffHint
+	if diff > 0 {
+		d.SizeDiffHint = diff
+	} else {
+		d.SizeDiffHint = 0
+	}
+}
+
+func (d *peerMsgHandler) onReadyChangePeer(cp *execResultChangePeer) {
+	// Your Code Here (3B).
+}
+
+func (d *peerMsgHandler) onReadyCompactLog(firstIndex uint64, truncatedIndex uint64) {
 	raftLogGCTask := &runner.RaftLogGCTask{
 		RaftEngine: d.ctx.engine.Raft,
 		RegionID:   d.regionId,
@@ -159,6 +240,10 @@ func (d *peerMsgHandler) ScheduleCompactLog(firstIndex uint64, truncatedIndex ui
 	}
 	d.LastCompactedIdx = raftLogGCTask.EndIdx
 	d.ctx.raftLogGCTaskSender <- raftLogGCTask
+}
+
+func (d *peerMsgHandler) onReadySplitRegion(derived *metapb.Region, regions []*metapb.Region) {
+	// Your Code Here (3B).
 }
 
 func (d *peerMsgHandler) onRaftMsg(msg *rspb.RaftMessage) error {
@@ -418,6 +503,7 @@ func (d *peerMsgHandler) onRaftGCLogTick() {
 		return
 	}
 
+	// Have no idea why subtract 1 here, but original code did this by magic.
 	y.Assert(compactIdx > 0)
 	compactIdx -= 1
 	if compactIdx < firstIdx {
