@@ -30,6 +30,8 @@ const (
 	MsgTypeRegionApproximateSize MsgType = 6
 	// message to trigger gc generated snapshots
 	MsgTypeGcSnap MsgType = 7
+	// message of apply result from apply worker
+	MsgTypeApplyRes MsgType = 8
 
 	// message wraps a raft message to the peer not existing on the Store.
 	// It is due to region split or add peer conf change
@@ -38,6 +40,13 @@ const (
 	MsgTypeStoreTick MsgType = 106
 	// message to start the ticker of store
 	MsgTypeStoreStart MsgType = 107
+
+	// message to apply committed entires
+	MsgTypeApplyCommitted MsgType = 301
+	// message to refresh apply worker region state
+	MsgTypeApplyRefresh MsgType = 302
+	// message to send proposal's callback to apply worker
+	MsgTypeApplyProposal MsgType = 303
 )
 
 type Msg struct {

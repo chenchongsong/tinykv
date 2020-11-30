@@ -15,6 +15,7 @@ import (
 type peerState struct {
 	closed uint32
 	peer   *peer
+	apply  *applier
 }
 
 // router routes a message to a peer.
@@ -43,7 +44,8 @@ func (pr *router) get(regionID uint64) *peerState {
 func (pr *router) register(peer *peer) {
 	id := peer.regionId
 	newPeer := &peerState{
-		peer: peer,
+		peer:  peer,
+		apply: newApplierFromPeer(peer),
 	}
 	pr.peers.Store(id, newPeer)
 }
@@ -53,6 +55,7 @@ func (pr *router) close(regionID uint64) {
 	if ok {
 		ps := v.(*peerState)
 		atomic.StoreUint32(&ps.closed, 1)
+		ps.apply.destroy()
 		pr.peers.Delete(regionID)
 	}
 }
