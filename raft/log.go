@@ -154,6 +154,32 @@ func (l *RaftLog) truncateAndAppend(ents []pb.Entry) {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	var fi, ft uint64
+	var err error
+	for {
+		fi, err = l.storage.FirstIndex()
+		if err != nil {
+			panic(err)
+		}
+		ft, err = l.storage.Term(fi - 1)
+		if err == ErrCompacted {
+			if i, _ := l.storage.FirstIndex(); i != fi {
+				// storage does compact after getting first index, so retry
+				continue
+			}
+		}
+		if err != nil {
+			panic(err)
+		}
+		break
+	}
+	compactSize := fi - l.offset
+	if compactSize > 0 && compactSize < uint64(len(l.entries)) {
+		l.entries = l.entries[compactSize:]
+		l.offset = fi
+		l.snapIndex = fi - 1
+		l.snapTerm = ft
+	}
 }
 
 // 2A
@@ -353,6 +379,18 @@ func (l *RaftLog) maybeCommit(maxIndex, term uint64) bool {
 		return true
 	}
 	return false
+}
+
+// 2B
+func (l *RaftLog) restore(s pb.Snapshot) {
+	log.Infof("log [%+v] starts to restore snapshot [index: %d, term: %d]", l, s.Metadata.Index, s.Metadata.Term)
+	l.committed = s.Metadata.Index
+	l.entries = nil
+	l.stabled = s.Metadata.Index
+	l.offset = s.Metadata.Index + 1
+	l.snapIndex = s.Metadata.Index
+	l.snapTerm = s.Metadata.Term
+	l.pendingSnapshot = &s
 }
 
 // 2A
