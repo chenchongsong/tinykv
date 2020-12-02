@@ -35,8 +35,6 @@ type PeerStorage struct {
 	region *metapb.Region
 	// current raft state of the peer
 	raftState rspb.RaftLocalState
-	// current apply state of the peer
-	applyState *rspb.RaftApplyState
 
 	// current snapshot state
 	snapState snap.SnapState
@@ -70,7 +68,6 @@ func NewPeerStorage(engines *engine_util.Engines, region *metapb.Region, regionS
 		region:      region,
 		Tag:         tag,
 		raftState:   *raftState,
-		applyState:  applyState,
 		regionSched: regionSched,
 	}, nil
 }
@@ -219,15 +216,20 @@ func (ps *PeerStorage) checkRange(low, high uint64) error {
 }
 
 func (ps *PeerStorage) truncatedIndex() uint64 {
-	return ps.applyState.TruncatedState.Index
+	return ps.applyState().TruncatedState.Index
 }
 
 func (ps *PeerStorage) truncatedTerm() uint64 {
-	return ps.applyState.TruncatedState.Term
+	return ps.applyState().TruncatedState.Term
 }
 
 func (ps *PeerStorage) AppliedIndex() uint64 {
-	return ps.applyState.AppliedIndex
+	return ps.applyState().AppliedIndex
+}
+
+func (ps *PeerStorage) applyState() *rspb.RaftApplyState {
+	state, _ := meta.GetApplyState(ps.Engines.Kv, ps.region.GetId())
+	return state
 }
 
 func (ps *PeerStorage) validateSnap(snap *eraftpb.Snapshot) bool {
@@ -343,7 +345,53 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
-	return nil, nil
+	if snapData.Region.Id != ps.region.Id {
+		return nil, fmt.Errorf("mismatch region id %v != %v", snapData.Region.Id, ps.region.Id)
+	}
+
+	if ps.isInitialized() {
+		// we can only delete the old data when the peer is initialized.
+		if err := ps.clearMeta(kvWB, raftWB); err != nil {
+			return nil, err
+		}
+		ps.clearExtraData(snapData.Region)
+	}
+
+	ps.raftState.LastIndex = snapshot.Metadata.Index
+	ps.raftState.LastTerm = snapshot.Metadata.Term
+
+	applyRes := &ApplySnapResult{
+		PrevRegion: ps.region,
+		Region:     snapData.Region,
+	}
+	ps.region = snapData.Region
+	applyState := &rspb.RaftApplyState{
+		AppliedIndex: snapshot.Metadata.Index,
+		// The snapshot only contains log which index > applied index, so
+		// here the truncate state's (index, term) is in snapshot metadata.
+		TruncatedState: &rspb.RaftTruncatedState{
+			Index: snapshot.Metadata.Index,
+			Term:  snapshot.Metadata.Term,
+		},
+	}
+	kvWB.SetMeta(meta.ApplyStateKey(ps.region.GetId()), applyState)
+	meta.WriteRegionState(kvWB, snapData.Region, rspb.PeerState_Normal)
+	ch := make(chan bool)
+	ps.snapState = snap.SnapState{
+		StateType: snap.SnapState_Applying,
+	}
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: ps.region.Id,
+		Notifier: ch,
+		SnapMeta: snapshot.Metadata,
+		StartKey: snapData.Region.GetStartKey(),
+		EndKey:   snapData.Region.GetEndKey(),
+	}
+	// wait until apply finish
+	<-ch
+
+	log.Debugf("%v apply snapshot for region %v with state %v ok", ps.Tag, snapData.Region, applyState)
+	return applyRes, nil
 }
 
 // Save memory states to disk.
