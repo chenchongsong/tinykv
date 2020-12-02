@@ -332,9 +332,49 @@ func (r *Raft) GetSnap() *pb.Snapshot {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	sindex, sterm := m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term
+	if r.restore(*m.Snapshot) {
+		log.Infof("%d [commit: %d] restored snapshot [index: %d, term: %d]",
+			r.id, r.RaftLog.committed, sindex, sterm)
+		r.send(pb.Message{To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.LastIndex()})
+	} else {
+		log.Infof("%d [commit: %d] ignored snapshot [index: %d, term: %d]",
+			r.id, r.RaftLog.committed, sindex, sterm)
+		r.send(pb.Message{To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.committed})
+	}
+}
+// 2B
+func (r *Raft) restore(s pb.Snapshot) bool {
+	if s.Metadata.Index <= r.RaftLog.committed {
+		return false
+	}
+	if r.RaftLog.matchTerm(s.Metadata.Index, s.Metadata.Term) {
+		log.Infof("%d [commit: %d, lastindex: %d, lastterm: %d] fast-forwarded commit to snapshot [index: %d, term: %d]",
+			r.id, r.RaftLog.committed, r.RaftLog.LastIndex(), r.RaftLog.lastTerm(), s.Metadata.Index, s.Metadata.Term)
+		r.RaftLog.commitTo(s.Metadata.Index)
+		return false
+	}
+
+	log.Infof("%d [commit: %d, lastindex: %d, lastterm: %d] starts to restore snapshot [index: %d, term: %d]",
+		r.id, r.RaftLog.committed, r.RaftLog.LastIndex(), r.RaftLog.lastTerm(), s.Metadata.Index, s.Metadata.Term)
+
+	r.RaftLog.restore(s)
+	r.Prs = make(map[uint64]*Progress)
+	r.restoreNode(s.Metadata.ConfState.Nodes)
+	return true
 }
 
-
+// 2B
+func (r *Raft) restoreNode(nodes []uint64) {
+	for _, n := range nodes {
+		match, next := uint64(0), r.RaftLog.LastIndex()+1
+		if n == r.id {
+			match = next - 1
+		}
+		r.setProgress(n, match, next)
+		log.Infof("%d restored progress of %d [%+v]", r.id, n, r.getProgress(n))
+	}
+}
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
