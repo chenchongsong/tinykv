@@ -378,8 +378,29 @@ func (r *Raft) restoreNode(nodes []uint64) {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	if r.getProgress(id) == nil {
+		r.setProgress(id, 0, r.RaftLog.LastIndex()+1)
+	} else {
+		return
+	}
 }
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	delete(r.Prs, id)
+
+	// do not try to commit or abort transferring if there is no nodes in the cluster.
+	if len(r.Prs) == 0 {
+		return
+	}
+
+	// The quorum size is now smaller, so see if any pending entries can
+	// be committed.
+	if r.maybeCommit() {
+		r.bcastAppend()
+	}
+	// If the removed node is the leadTransferee, then abort the leadership transferring.
+	if r.State == StateLeader && r.leadTransferee == id {
+		r.abortLeaderTransfer()
+	}
 }
