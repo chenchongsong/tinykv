@@ -2,6 +2,7 @@ package raftstore
 
 import (
 	"fmt"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"time"
 
 	"github.com/Connor1996/badger/y"
@@ -229,6 +230,50 @@ func (d *peerMsgHandler) onApplyResult(res *MsgApplyRes) {
 
 func (d *peerMsgHandler) onReadyChangePeer(cp *execResultChangePeer) {
 	// Your Code Here (3B).
+	changeType := cp.confChange.ChangeType
+	d.RaftGroup.ApplyConfChange(*cp.confChange)
+	if cp.confChange.NodeId == 0 {
+		// Apply failed, skip.
+		return
+	}
+	d.ctx.storeMeta.setRegion(cp.region, d.peer)
+	peerID := cp.peer.Id
+	switch changeType {
+	case eraftpb.ConfChangeType_AddNode:
+		// Add this peer to cache and heartbeats.
+		now := time.Now()
+		if d.IsLeader() {
+			d.PeersStartPendingTime[peerID] = now
+		}
+		d.insertPeerCache(cp.peer)
+	case eraftpb.ConfChangeType_RemoveNode:
+		// Remove this peer from cache.
+		if d.IsLeader() {
+			delete(d.PeersStartPendingTime, peerID)
+		}
+		d.removePeerCache(peerID)
+	}
+
+	// In pattern matching above, if the peer is the leader,
+	// it will push the change peer into `peers_start_pending_time`
+	// without checking if it is duplicated. We move `heartbeat_pd` here
+	// to utilize `collect_pending_peers` in `heartbeat_pd` to avoid
+	// adding the redundant peer.
+	if d.IsLeader() {
+		// Notify scheduler immediately.
+		log.Infof("%s notify scheduler with change peer region %s", d.Tag, d.Region())
+		d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+	}
+	myPeerID := d.PeerId()
+
+	// We only care remove itself now.
+	if changeType == eraftpb.ConfChangeType_RemoveNode && cp.peer.StoreId == d.storeID() {
+		if myPeerID == peerID {
+			d.destroyPeer()
+		} else {
+			panic(fmt.Sprintf("%s trying to remove unknown peer %s", d.Tag, cp.peer))
+		}
+	}
 }
 
 func (d *peerMsgHandler) onReadyCompactLog(firstIndex uint64, truncatedIndex uint64) {
@@ -244,6 +289,84 @@ func (d *peerMsgHandler) onReadyCompactLog(firstIndex uint64, truncatedIndex uin
 
 func (d *peerMsgHandler) onReadySplitRegion(derived *metapb.Region, regions []*metapb.Region) {
 	// Your Code Here (3B).
+	meta := d.ctx.storeMeta
+	regionID := derived.Id
+	meta.setRegion(derived, d.peer)
+	d.SizeDiffHint = 0
+	isLeader := d.IsLeader()
+	if isLeader {
+		d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+		// Notify scheduler immediately to let it update the region meta.
+		log.Infof("%s notify scheduler with split count %d", d.Tag, len(regions))
+	}
+
+	if meta.regionRanges.Delete(&regionItem{region: regions[0]}) == nil {
+		panic(d.Tag + " original region should exist")
+	}
+	// It's not correct anymore, so set it to None to let split checker update it.
+	d.ApproximateSize = nil
+
+	for _, newRegion := range regions {
+		newRegionID := newRegion.Id
+		notExist := meta.regionRanges.ReplaceOrInsert(&regionItem{region: newRegion})
+		if notExist != nil {
+			panic(fmt.Sprintf("%v %v newregion:%v, region:%v", d.Tag, notExist.(*regionItem).region, newRegion, regions[0]))
+		}
+		if newRegionID == regionID {
+			continue
+		}
+
+		// Insert new regions and validation
+		log.Infof("[region %d] inserts new region %s", regionID, newRegion)
+		if r, ok := meta.regions[newRegionID]; ok {
+			// Suppose a new node is added by conf change and the snapshot comes slowly.
+			// Then, the region splits and the first vote message comes to the new node
+			// before the old snapshot, which will create an uninitialized peer on the
+			// store. After that, the old snapshot comes, followed with the last split
+			// proposal. After it's applied, the uninitialized peer will be met.
+			// We can remove this uninitialized peer directly.
+			if len(r.Peers) > 0 {
+				panic(fmt.Sprintf("[region %d] duplicated region %s for split region %s",
+					newRegionID, r, newRegion))
+			}
+			d.ctx.router.close(newRegionID)
+		}
+
+		newPeer, err := createPeer(d.ctx.store.Id, d.ctx.cfg, d.ctx.regionTaskSender, d.ctx.engine, newRegion)
+		if err != nil {
+			// peer information is already written into db, can't recover.
+			// there is probably a bug.
+			panic(fmt.Sprintf("create new split region %s error %v", newRegion, err))
+		}
+		metaPeer := newPeer.Meta
+
+		for _, p := range newRegion.GetPeers() {
+			newPeer.insertPeerCache(p)
+		}
+
+		// New peer derive write flow from parent region,
+		// this will be used by balance write flow.
+		campaigned := newPeer.MaybeCampaign(isLeader)
+
+		if isLeader {
+			// The new peer is likely to become leader, send a heartbeat immediately to reduce
+			// client query miss.
+			newPeer.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+		}
+
+		meta.regions[newRegionID] = newRegion
+		d.ctx.router.register(newPeer)
+		_ = d.ctx.router.send(newRegionID, message.NewPeerMsg(message.MsgTypeStart, newRegionID, nil))
+		if !campaigned {
+			for i, msg := range meta.pendingVotes {
+				if util.PeerEqual(msg.ToPeer, metaPeer) {
+					meta.pendingVotes = append(meta.pendingVotes[:i], meta.pendingVotes[i+1:]...)
+					_ = d.ctx.router.send(newRegionID, message.NewPeerMsg(message.MsgTypeRaftMessage, newRegionID, msg))
+					break
+				}
+			}
+		}
+	}
 }
 
 func (d *peerMsgHandler) onRaftMsg(msg *rspb.RaftMessage) error {

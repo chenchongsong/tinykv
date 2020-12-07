@@ -692,7 +692,7 @@ func TestSplitRecover3B(t *testing.T) {
 
 func TestSplitRecoverManyClients3B(t *testing.T) {
 	// Test: restarts, snapshots, conf change, many clients (3B) ...
-	GenericTest(t, "3B", 20, false, true, false, -1, false, true)
+	GenericTest(t, "3B", 5, false, true, false, -1, false, true)
 }
 
 func TestSplitUnreliable3B(t *testing.T) {
