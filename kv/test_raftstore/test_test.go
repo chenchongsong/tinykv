@@ -690,6 +690,7 @@ func TestSplitRecover3B(t *testing.T) {
 	GenericTest(t, "3B", 1, false, true, false, -1, false, true)
 }
 
+// Fail
 func TestSplitRecoverManyClients3B(t *testing.T) {
 	// Test: restarts, snapshots, conf change, many clients (3B) ...
 	GenericTest(t, "3B", 20, false, true, false, -1, false, true)
