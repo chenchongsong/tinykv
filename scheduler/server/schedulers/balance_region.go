@@ -14,10 +14,15 @@
 package schedulers
 
 import (
+	"sort"
+
+	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/core"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule/operator"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule/opt"
+	"github.com/pingcap/log"
+	"go.uber.org/zap"
 )
 
 func init() {
@@ -76,7 +81,119 @@ func (s *balanceRegionScheduler) IsScheduleAllowed(cluster opt.Cluster) bool {
 }
 
 func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operator {
-	// Your Code Here (3C).
+	allStores := cluster.GetStores()
+	var stores []*core.StoreInfo
 
+	for _, store := range allStores {
+		if !store.IsUp() || store.DownTime() > cluster.GetMaxStoreDownTime() {
+			continue
+		}
+		stores = append(stores, store)
+	}
+
+	sort.Slice(stores, func(i, j int) bool {
+		return stores[i].GetRegionSize() > stores[j].GetRegionSize()
+	})
+	for _, source := range stores {
+		sourceID := source.GetID()
+
+		for i := 0; i < balanceRegionRetryLimit; i++ {
+			// Priority picks the region that has a pending peer.
+			// Pending region may means the disk is overload, remove the pending region firstly.
+			var region *core.RegionInfo
+			cluster.GetPendingRegionsWithLock(sourceID, func(regions core.RegionsContainer) {
+				region = regions.RandomRegion(nil, nil)
+			})
+			if region == nil {
+				// Then picks the region that has a follower in the source store.
+				cluster.GetFollowersWithLock(sourceID, func(regions core.RegionsContainer) {
+					region = regions.RandomRegion(nil, nil)
+				})
+			}
+			if region == nil {
+				// Last, picks the region has the leader in the source store.
+				cluster.GetLeadersWithLock(sourceID, func(regions core.RegionsContainer) {
+					region = regions.RandomRegion(nil, nil)
+				})
+			}
+			if region == nil {
+				continue
+			}
+			log.Debug("select region", zap.String("scheduler", s.GetName()), zap.Uint64("region-id", region.GetID()))
+
+			// We don't schedule region with abnormal number of replicas.
+			if len(region.GetPeers()) != cluster.GetMaxReplicas() {
+				log.Debug("region has abnormal replica count", zap.String("scheduler", s.GetName()), zap.Uint64("region-id", region.GetID()))
+				continue
+			}
+
+			oldPeer := region.GetStorePeer(sourceID)
+			if op := s.transferPeer(cluster, region, oldPeer); op != nil {
+				return op
+			}
+		}
+	}
 	return nil
+}
+// 3C
+// transferPeer selects the best store to create a new peer to replace the old peer.
+func (s *balanceRegionScheduler) transferPeer(cluster opt.Cluster, region *core.RegionInfo, oldPeer *metapb.Peer) *operator.Operator {
+	sourceStoreID := oldPeer.GetStoreId()
+	source := cluster.GetStore(sourceStoreID)
+	if source == nil {
+		log.Error("failed to get the source store", zap.Uint64("store-id", sourceStoreID))
+	}
+
+	storeID := selectBestReplacementStore(cluster, region)
+	if storeID == 0 {
+		return nil
+	}
+
+	target := cluster.GetStore(storeID)
+	if target == nil {
+		log.Error("failed to get the target store", zap.Uint64("store-id", storeID))
+		return nil
+	}
+	regionID := region.GetID()
+	sourceID := source.GetID()
+	targetID := target.GetID()
+	log.Debug("", zap.Uint64("region-id", regionID), zap.Uint64("source-store", sourceID), zap.Uint64("target-store", targetID))
+
+	if int64(source.GetRegionSize()-target.GetRegionSize()) < 2*region.GetApproximateSize() {
+		return nil
+	}
+
+	newPeer, err := cluster.AllocPeer(storeID)
+	if err != nil {
+		return nil
+	}
+	op, err := operator.CreateMovePeerOperator("balance-region", cluster, region, operator.OpBalance, oldPeer.GetStoreId(), newPeer.GetStoreId(), newPeer.GetId())
+	if err != nil {
+		return nil
+	}
+	return op
+}
+// 3C
+func selectBestReplacementStore(cluster opt.Cluster, region *core.RegionInfo) uint64 {
+	var (
+		best *core.StoreInfo
+	)
+	for _, store := range cluster.GetStores() {
+		_, ok := region.GetStoreIds()[store.GetID()]
+		if ok {
+			continue
+		}
+
+		if !store.IsUp() || store.DownTime() > cluster.GetMaxStoreDownTime() {
+			continue
+		}
+
+		if best == nil || store.GetRegionSize() < best.GetRegionSize() {
+			best = store
+		}
+	}
+	if best == nil {
+		return 0
+	}
+	return best.GetID()
 }
