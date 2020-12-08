@@ -177,22 +177,54 @@ func (server *Server) KvCommit(_ context.Context, req *kvrpcpb.CommitRequest) (*
 
 func (server *Server) KvScan(_ context.Context, req *kvrpcpb.ScanRequest) (*kvrpcpb.ScanResponse, error) {
 	// Your Code Here (4C).
-	return nil, nil
+	cmd := commands.NewScan(req)
+	resp, err := server.Run(&cmd)
+	if err != nil {
+		resp, err = regionError(err, new(kvrpcpb.ScanResponse))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return resp.(*kvrpcpb.ScanResponse), err
 }
 
 func (server *Server) KvCheckTxnStatus(_ context.Context, req *kvrpcpb.CheckTxnStatusRequest) (*kvrpcpb.CheckTxnStatusResponse, error) {
 	// Your Code Here (4C).
-	return nil, nil
+	cmd := commands.NewCheckTxnStatus(req)
+	resp, err := server.Run(&cmd)
+	if err != nil {
+		resp, err = regionError(err, new(kvrpcpb.CheckTxnStatusResponse))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return resp.(*kvrpcpb.CheckTxnStatusResponse), err
 }
 
 func (server *Server) KvBatchRollback(_ context.Context, req *kvrpcpb.BatchRollbackRequest) (*kvrpcpb.BatchRollbackResponse, error) {
 	// Your Code Here (4C).
-	return nil, nil
+	cmd := commands.NewRollback(req)
+	resp, err := server.Run(&cmd)
+	if err != nil {
+		resp, err = regionError(err, new(kvrpcpb.BatchRollbackResponse))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return resp.(*kvrpcpb.BatchRollbackResponse), err
 }
 
 func (server *Server) KvResolveLock(_ context.Context, req *kvrpcpb.ResolveLockRequest) (*kvrpcpb.ResolveLockResponse, error) {
 	// Your Code Here (4C).
-	return nil, nil
+	cmd := commands.NewResolveLock(req)
+	resp, err := server.Run(&cmd)
+	if err != nil {
+		resp, err = regionError(err, new(kvrpcpb.ResolveLockResponse))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return resp.(*kvrpcpb.ResolveLockResponse), err
 }
 
 // SQL push down commands.
